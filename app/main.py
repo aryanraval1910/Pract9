@@ -1,28 +1,30 @@
-"""VaultNotes - a DELIBERATELY INSECURE demo API for the DevSecOps lab (PR9).
+"""VaultNotes - REMEDIATED version of app/main.py for the DevSecOps lab (PR9).
 
-Every weakness below is intentional so that the scanners in the pipeline have
-something real to find. Each one is tagged with the rule that should catch it.
-
-    !!  Do NOT deploy this anywhere reachable from the internet.  !!
+Each change maps to a finding in the pipeline report; see docs/REMEDIATION.md.
 """
+import ast
 import hashlib
+import operator
 import os
 import sqlite3
 import subprocess
+import tempfile
+from urllib.parse import urlparse
 
 import requests
 import yaml
-from flask import Flask, jsonify, request
+from flask import Flask, abort, jsonify, request
 
 app = Flask(__name__)
 
-# [Bandit B105] hard-coded secret used for session signing.
-app.config["SECRET_KEY"] = "vaultnotes-dev-secret-2026"
+# Secrets come from the environment (in CI: GitHub repository secrets).
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or os.urandom(32).hex()
+PAYMENT_GATEWAY_API_KEY = os.environ.get("PAYMENT_GATEWAY_API_KEY", "")
 
-# [Gitleaks generic-api-key] fake credential committed to source control.
-PAYMENT_GATEWAY_API_KEY = "pgw_live_k8Hs92LmQp7XvT4zRn1BdW6yUe3JcA5o"
-
-DB_PATH = os.environ.get("DB_PATH", "/tmp/vaultnotes.db")
+DB_PATH = os.environ.get(
+    "DB_PATH", os.path.join(tempfile.gettempdir(), "vaultnotes.db")
+)
+ALLOWED_FETCH_HOSTS = {"example.org", "api.github.com"}
 
 
 def get_db():
@@ -58,52 +60,76 @@ def health():
 
 @app.get("/notes")
 def search_notes():
-    """[Bandit B608] SQL built with an f-string -> SQL injection."""
+    """Parameterised query: user input is data, never SQL."""
     term = request.args.get("q", "")
-    query = f"SELECT id, owner, body FROM notes WHERE body LIKE '%{term}%'"
-    rows = get_db().execute(query).fetchall()
+    rows = get_db().execute(
+        "SELECT id, owner, body FROM notes WHERE body LIKE ?", (f"%{term}%",)
+    ).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
 @app.get("/diag")
 def diag():
-    """[Bandit B602] shell=True with user input -> command injection."""
+    """Argument list, no shell: the input cannot become a second command."""
     name = request.args.get("name", "world")
-    out = subprocess.run(
-        f"echo diagnostic for {name}", shell=True, capture_output=True, text=True
+    out = subprocess.run(  # nosec B603 B607 - fixed binary, no shell, list args
+        ["echo", "diagnostic for", name], capture_output=True, text=True, check=False
     )
     return jsonify(output=out.stdout.strip())
 
 
+_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _safe_eval(node):
+    """Evaluate +, -, *, / over numbers only. Anything else is rejected."""
+    if isinstance(node, ast.Expression):
+        return _safe_eval(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+        return _OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+    raise ValueError("unsupported expression")
+
+
 @app.get("/calc")
 def calc():
-    """[Bandit B307] eval() on user input -> arbitrary code execution."""
     expr = request.args.get("expr", "0")
-    return jsonify(result=eval(expr))
+    try:
+        return jsonify(result=_safe_eval(ast.parse(expr, mode="eval")))
+    except (ValueError, SyntaxError, ZeroDivisionError):
+        abort(400, description="invalid expression")
 
 
 @app.get("/hash")
 def hash_text():
-    """[Bandit B324] MD5 is a broken hash for anything security related."""
+    """SHA-256 instead of MD5."""
     text = request.args.get("text", "")
-    return jsonify(md5=hashlib.md5(text.encode()).hexdigest())
+    return jsonify(sha256=hashlib.sha256(text.encode()).hexdigest())
 
 
 @app.post("/config")
 def load_config():
-    """[Bandit B506] yaml.load with the full Loader -> object instantiation."""
-    data = yaml.load(request.get_data(), Loader=yaml.Loader)
+    """safe_load only builds plain data types."""
+    data = yaml.safe_load(request.get_data())
     return jsonify(loaded=str(data))
 
 
 @app.get("/fetch")
 def fetch():
-    """[Bandit B501 + B113] TLS verification off, no timeout, user-chosen URL."""
+    """Allow-listed hosts, TLS verification on (default), bounded by a timeout."""
     url = request.args.get("url", "https://example.org")
-    resp = requests.get(url, verify=False)
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_FETCH_HOSTS:
+        abort(400, description="host not allowed")
+    resp = requests.get(url, timeout=5)
     return jsonify(status=resp.status_code, length=len(resp.content))
 
 
 if __name__ == "__main__":
-    # [Bandit B201 + B104] debug server bound to every interface.
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.run(host="127.0.0.1", port=8000)
